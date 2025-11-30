@@ -9,14 +9,14 @@ def flash_attention_kernel(
     # Pointers to matrices
     Q_ptr, K_ptr, V_ptr, O_ptr,
     # Matrix dimensions
-    batch_size, num_heads, seq_len, head_dim,
+    seq_len,
     # Scaling factor
     scale,
-    # Strides for tensor access
-    stride_qb, stride_qh, stride_qs, stride_qd,
-    stride_kb, stride_kh, stride_ks, stride_kd,
-    stride_vb, stride_vh, stride_vs, stride_vd,
-    stride_ob, stride_oh, stride_os, stride_od,
+    # Strides for Q, K, V, O (seq, head_dim)
+    stride_qs, stride_qd,
+    stride_ks, stride_kd,
+    stride_vs, stride_vd,
+    stride_os, stride_od,
     # Block sizes
     BLOCK_SIZE_M: tl.constexpr,  # Number of queries per block
     BLOCK_SIZE_N: tl.constexpr,  # Number of keys/values per block
@@ -24,31 +24,36 @@ def flash_attention_kernel(
 ):
     """
     Triton implementation of FlashAttention with online softmax.
-
-    This kernel processes attention in blocks to minimize HBM accesses,
-    using online softmax to avoid materializing the full attention matrix.
+    Uses tl.make_block_ptr for better memory access patterns.
     """
-    # Program IDs - scalar indices
-    batch_idx = tl.program_id(0)    # which batch, scalar
-    head_idx = tl.program_id(1)     # which head, scalar
-    block_m_idx = tl.program_id(2)  # which query block (0 to seq_len/BLOCK_SIZE_M - 1), scalar
-
-    # Base pointer for this batch/head - scalar
-    q_block_ptr = Q_ptr + batch_idx * stride_qb + head_idx * stride_qh  # scalar
+    # Program IDs
+    block_m_idx = tl.program_id(0)  # which query block
+    bh_idx = tl.program_id(1)       # which batch/head combo
 
     start_m = block_m_idx * BLOCK_SIZE_M  # scalar
 
-    # Offsets within the block
-    offs_m = start_m + tl.arange(0, BLOCK_SIZE_M)  # (BLOCK_SIZE_M,) - query indices [start_m, start_m + BLOCK_SIZE_M)
-    offs_d = tl.arange(0, BLOCK_SIZE_D)            # (BLOCK_SIZE_D,) - head dim indices [0, BLOCK_SIZE_D)
+    # Offset pointers to this batch/head's data
+    bh_offset = bh_idx * seq_len * BLOCK_SIZE_D
+    Q_bh = Q_ptr + bh_offset
+    K_bh = K_ptr + bh_offset
+    V_bh = V_ptr + bh_offset
+    O_bh = O_ptr + bh_offset
 
-    # Load Q block
-    q_ptrs = q_block_ptr + offs_m[:, None] * stride_qs + offs_d[None, :] * stride_qd  # (BLOCK_SIZE_M, BLOCK_SIZE_D)
-    q = tl.load(q_ptrs, mask=offs_m[:, None] < seq_len, other=0.0)  # (BLOCK_SIZE_M, BLOCK_SIZE_D)
+    # Create block pointers for Q - load once, reuse across K/V blocks
+    q_block_ptr = tl.make_block_ptr(
+        base=Q_bh,
+        shape=(seq_len, BLOCK_SIZE_D),
+        strides=(stride_qs, stride_qd),
+        offsets=(start_m, 0),
+        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_D),
+        order=(1, 0),
+    )
 
-    # Base pointers for K and V - scalars
-    k_block_ptr = K_ptr + batch_idx * stride_kb + head_idx * stride_kh  # scalar
-    v_block_ptr = V_ptr + batch_idx * stride_vb + head_idx * stride_vh  # scalar
+    # Load Q block once - (BLOCK_SIZE_M, BLOCK_SIZE_D)
+    q = tl.load(q_block_ptr, boundary_check=(0,))  # (BLOCK_SIZE_M, BLOCK_SIZE_D)
+
+    # Scale Q once instead of scaling scores every iteration
+    q = (q * scale).to(tl.float16)  # (BLOCK_SIZE_M, BLOCK_SIZE_D)
 
     # Online softmax state (all in SRAM)
     m_i = tl.full((BLOCK_SIZE_M,), float('-inf'), dtype=tl.float32)    # (BLOCK_SIZE_M,) - running max
@@ -57,20 +62,33 @@ def flash_attention_kernel(
 
     # Loop over key/value blocks
     for start_n in range(0, seq_len, BLOCK_SIZE_N):
-        offs_n = start_n + tl.arange(0, BLOCK_SIZE_N)  # (BLOCK_SIZE_N,) - key/value indices
-
-        # Compute pointers for K and V blocks
-        k_ptrs = k_block_ptr + offs_n[:, None] * stride_ks + offs_d[None, :] * stride_kd  # (BLOCK_SIZE_N, BLOCK_SIZE_D)
-        v_ptrs = v_block_ptr + offs_n[:, None] * stride_vs + offs_d[None, :] * stride_vd  # (BLOCK_SIZE_N, BLOCK_SIZE_D)
+        # Create block pointers for K and V
+        k_block_ptr = tl.make_block_ptr(
+            base=K_bh,
+            shape=(seq_len, BLOCK_SIZE_D),
+            strides=(stride_ks, stride_kd),
+            offsets=(start_n, 0),
+            block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_D),
+            order=(1, 0),
+        )
+        v_block_ptr = tl.make_block_ptr(
+            base=V_bh,
+            shape=(seq_len, BLOCK_SIZE_D),
+            strides=(stride_vs, stride_vd),
+            offsets=(start_n, 0),
+            block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_D),
+            order=(1, 0),
+        )
 
         # Load K and V blocks
-        k = tl.load(k_ptrs, mask=offs_n[:, None] < seq_len, other=0.0)  # (BLOCK_SIZE_N, BLOCK_SIZE_D)
-        v = tl.load(v_ptrs, mask=offs_n[:, None] < seq_len, other=0.0)  # (BLOCK_SIZE_N, BLOCK_SIZE_D)
+        k = tl.load(k_block_ptr, boundary_check=(0,))  # (BLOCK_SIZE_N, BLOCK_SIZE_D)
+        v = tl.load(v_block_ptr, boundary_check=(0,))  # (BLOCK_SIZE_N, BLOCK_SIZE_D)
 
-        # Compute attention scores: Q @ K^T * scale
-        scores = tl.dot(q, tl.trans(k)) * scale  # (BLOCK_SIZE_M, BLOCK_SIZE_N)
+        # Compute attention scores: Q @ K^T (already scaled Q)
+        scores = tl.dot(q, tl.trans(k))  # (BLOCK_SIZE_M, BLOCK_SIZE_N)
 
         # Mask out-of-bounds keys
+        offs_n = start_n + tl.arange(0, BLOCK_SIZE_N)  # (BLOCK_SIZE_N,)
         scores = tl.where(offs_n[None, :] < seq_len, scores, float('-inf'))  # (BLOCK_SIZE_M, BLOCK_SIZE_N)
 
         # Online softmax update
@@ -96,10 +114,16 @@ def flash_attention_kernel(
     # Final normalization: divide by sum of softmax weights
     acc = acc / l_i[:, None]  # (BLOCK_SIZE_M, BLOCK_SIZE_D)
 
-    # Store output
-    o_block_ptr = O_ptr + batch_idx * stride_ob + head_idx * stride_oh  # scalar
-    o_ptrs = o_block_ptr + offs_m[:, None] * stride_os + offs_d[None, :] * stride_od  # (BLOCK_SIZE_M, BLOCK_SIZE_D)
-    tl.store(o_ptrs, acc.to(tl.float16), mask=offs_m[:, None] < seq_len)
+    # Store output using block pointer
+    o_block_ptr = tl.make_block_ptr(
+        base=O_bh,
+        shape=(seq_len, BLOCK_SIZE_D),
+        strides=(stride_os, stride_od),
+        offsets=(start_m, 0),
+        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_D),
+        order=(1, 0),
+    )
+    tl.store(o_block_ptr, acc.to(tl.float16), boundary_check=(0,))
 
 def flash_attention_forward(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
     """
@@ -126,35 +150,39 @@ def flash_attention_forward(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -
     O = torch.empty_like(Q)  # (batch_size, num_heads, seq_len, head_dim)
 
     # Define block sizes for tiling
-    # These can be tuned for optimal performance
     BLOCK_SIZE_M = 64  # Number of queries per block (must be power of 2)
     BLOCK_SIZE_N = 64  # Number of keys/values per block (must be power of 2)
-    BLOCK_SIZE_D = min(128, head_dim)  # Head dimension block size
+    BLOCK_SIZE_D = head_dim  # Head dimension (must match exactly)
 
-    # Calculate grid dimensions
-    grid = (
-        batch_size,      # batch dimension
-        num_heads,       # head dimension
-        triton.cdiv(seq_len, BLOCK_SIZE_M),  # query sequence dimension
-    )
+    # Reshape to merge batch and heads: (batch*heads, seq_len, head_dim)
+    Q_flat = Q.view(batch_size * num_heads, seq_len, head_dim)  # (B*H, S, D)
+    K_flat = K.view(batch_size * num_heads, seq_len, head_dim)  # (B*H, S, D)
+    V_flat = V.view(batch_size * num_heads, seq_len, head_dim)  # (B*H, S, D)
+    O_flat = O.view(batch_size * num_heads, seq_len, head_dim)  # (B*H, S, D)
 
-    # Launch kernel
+    # Grid: one program per (query_block, batch*head)
+    num_m_blocks = triton.cdiv(seq_len, BLOCK_SIZE_M)
+
+    # Stride to jump between batch/head slices
+    stride_bh = seq_len * head_dim  # elements between consecutive batch/head slices
+
+    # Launch all kernels in parallel with 2D grid
+    grid = (num_m_blocks, batch_size * num_heads)
     flash_attention_kernel[grid](
-        Q_ptr=Q, K_ptr=K, V_ptr=V, O_ptr=O,
-        batch_size=batch_size, num_heads=num_heads,
-        seq_len=seq_len, head_dim=head_dim,
+        Q_ptr=Q_flat,
+        K_ptr=K_flat,
+        V_ptr=V_flat,
+        O_ptr=O_flat,
+        seq_len=seq_len,
         scale=scale,
-        stride_qb=Q.stride(0), stride_qh=Q.stride(1),
-        stride_qs=Q.stride(2), stride_qd=Q.stride(3),
-        stride_kb=K.stride(0), stride_kh=K.stride(1),
-        stride_ks=K.stride(2), stride_kd=K.stride(3),
-        stride_vb=V.stride(0), stride_vh=V.stride(1),
-        stride_vs=V.stride(2), stride_vd=V.stride(3),
-        stride_ob=O.stride(0), stride_oh=O.stride(1),
-        stride_os=O.stride(2), stride_od=O.stride(3),
+        stride_qs=Q_flat.stride(1), stride_qd=Q_flat.stride(2),
+        stride_ks=K_flat.stride(1), stride_kd=K_flat.stride(2),
+        stride_vs=V_flat.stride(1), stride_vd=V_flat.stride(2),
+        stride_os=O_flat.stride(1), stride_od=O_flat.stride(2),
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
         BLOCK_SIZE_D=BLOCK_SIZE_D,
+        num_warps=4,
     )
 
     return O
