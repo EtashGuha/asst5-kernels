@@ -28,8 +28,78 @@ def flash_attention_kernel(
     This kernel processes attention in blocks to minimize HBM accesses,
     using online softmax to avoid materializing the full attention matrix.
     """
-    # TODO: Your implementation goes here.
-    pass
+    # Program IDs - scalar indices
+    batch_idx = tl.program_id(0)    # which batch, scalar
+    head_idx = tl.program_id(1)     # which head, scalar
+    block_m_idx = tl.program_id(2)  # which query block (0 to seq_len/BLOCK_SIZE_M - 1), scalar
+
+    # Base pointer for this batch/head - scalar
+    q_block_ptr = Q_ptr + batch_idx * stride_qb + head_idx * stride_qh  # scalar
+
+    start_m = block_m_idx * BLOCK_SIZE_M  # scalar
+
+    # Offsets within the block
+    offs_m = start_m + tl.arange(0, BLOCK_SIZE_M)  # (BLOCK_SIZE_M,) - query indices [start_m, start_m + BLOCK_SIZE_M)
+    offs_d = tl.arange(0, BLOCK_SIZE_D)            # (BLOCK_SIZE_D,) - head dim indices [0, BLOCK_SIZE_D)
+
+    # Load Q block
+    q_ptrs = q_block_ptr + offs_m[:, None] * stride_qs + offs_d[None, :] * stride_qd  # (BLOCK_SIZE_M, BLOCK_SIZE_D)
+    q = tl.load(q_ptrs, mask=offs_m[:, None] < seq_len, other=0.0)  # (BLOCK_SIZE_M, BLOCK_SIZE_D)
+
+    # Base pointers for K and V - scalars
+    k_block_ptr = K_ptr + batch_idx * stride_kb + head_idx * stride_kh  # scalar
+    v_block_ptr = V_ptr + batch_idx * stride_vb + head_idx * stride_vh  # scalar
+
+    # Online softmax state (all in SRAM)
+    m_i = tl.full((BLOCK_SIZE_M,), float('-inf'), dtype=tl.float32)    # (BLOCK_SIZE_M,) - running max
+    l_i = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)                  # (BLOCK_SIZE_M,) - running sum of exp
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_D), dtype=tl.float32)     # (BLOCK_SIZE_M, BLOCK_SIZE_D) - running output accumulator
+
+    # Loop over key/value blocks
+    for start_n in range(0, seq_len, BLOCK_SIZE_N):
+        offs_n = start_n + tl.arange(0, BLOCK_SIZE_N)  # (BLOCK_SIZE_N,) - key/value indices
+
+        # Compute pointers for K and V blocks
+        k_ptrs = k_block_ptr + offs_n[:, None] * stride_ks + offs_d[None, :] * stride_kd  # (BLOCK_SIZE_N, BLOCK_SIZE_D)
+        v_ptrs = v_block_ptr + offs_n[:, None] * stride_vs + offs_d[None, :] * stride_vd  # (BLOCK_SIZE_N, BLOCK_SIZE_D)
+
+        # Load K and V blocks
+        k = tl.load(k_ptrs, mask=offs_n[:, None] < seq_len, other=0.0)  # (BLOCK_SIZE_N, BLOCK_SIZE_D)
+        v = tl.load(v_ptrs, mask=offs_n[:, None] < seq_len, other=0.0)  # (BLOCK_SIZE_N, BLOCK_SIZE_D)
+
+        # Compute attention scores: Q @ K^T * scale
+        scores = tl.dot(q, tl.trans(k)) * scale  # (BLOCK_SIZE_M, BLOCK_SIZE_N)
+
+        # Mask out-of-bounds keys
+        scores = tl.where(offs_n[None, :] < seq_len, scores, float('-inf'))  # (BLOCK_SIZE_M, BLOCK_SIZE_N)
+
+        # Online softmax update
+        m_ij = tl.max(scores, axis=1)              # (BLOCK_SIZE_M,) - max of current block
+        m_new = tl.maximum(m_i, m_ij)              # (BLOCK_SIZE_M,) - new running max
+
+        # Correction factor for previous accumulator
+        alpha = tl.exp(m_i - m_new)                # (BLOCK_SIZE_M,) - rescale factor for old values
+
+        # Compute softmax of current block with new max
+        p = tl.exp(scores - m_new[:, None])        # (BLOCK_SIZE_M, BLOCK_SIZE_N) - exp(scores - m_new)
+
+        # Update running sum: l_new = alpha * l_i + sum(p)
+        l_new = alpha * l_i + tl.sum(p, axis=1)    # (BLOCK_SIZE_M,)
+
+        # Update accumulator: acc_new = alpha * acc + p @ v
+        acc = alpha[:, None] * acc + tl.dot(p.to(v.dtype), v)  # (BLOCK_SIZE_M, BLOCK_SIZE_D)
+
+        # Update state for next iteration
+        m_i = m_new  # (BLOCK_SIZE_M,)
+        l_i = l_new  # (BLOCK_SIZE_M,)
+
+    # Final normalization: divide by sum of softmax weights
+    acc = acc / l_i[:, None]  # (BLOCK_SIZE_M, BLOCK_SIZE_D)
+
+    # Store output
+    o_block_ptr = O_ptr + batch_idx * stride_ob + head_idx * stride_oh  # scalar
+    o_ptrs = o_block_ptr + offs_m[:, None] * stride_os + offs_d[None, :] * stride_od  # (BLOCK_SIZE_M, BLOCK_SIZE_D)
+    tl.store(o_ptrs, acc.to(tl.float16), mask=offs_m[:, None] < seq_len)
 
 def flash_attention_forward(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
     """
@@ -44,16 +114,16 @@ def flash_attention_forward(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -
         Output tensor of shape (batch_size, num_heads, seq_len, head_dim)
     """
     # Ensure inputs are on CUDA and in FP16
-    Q = Q.contiguous().cuda().half()
-    K = K.contiguous().cuda().half()
-    V = V.contiguous().cuda().half()
+    Q = Q.contiguous().cuda().half()  # (batch_size, num_heads, seq_len, head_dim)
+    K = K.contiguous().cuda().half()  # (batch_size, num_heads, seq_len, head_dim)
+    V = V.contiguous().cuda().half()  # (batch_size, num_heads, seq_len, head_dim)
 
     # Extract dimensions
     batch_size, num_heads, seq_len, head_dim = Q.shape
-    scale = 1.0 / (head_dim ** 0.5)
+    scale = 1.0 / (head_dim ** 0.5)  # scalar
 
     # Create output tensor
-    O = torch.empty_like(Q)
+    O = torch.empty_like(Q)  # (batch_size, num_heads, seq_len, head_dim)
 
     # Define block sizes for tiling
     # These can be tuned for optimal performance
