@@ -51,7 +51,7 @@ def generate_input(batch_size: int, in_features: int, hidden_size: int, seed: in
     gen = torch.Generator(device='cuda')
     gen.manual_seed(seed)
     
-    precision_dtype = torch.float16
+    precision_dtype = torch.float32
 
     # Always generate 3D input: (batch_size, seq_len, in_features)
     if seq is None:

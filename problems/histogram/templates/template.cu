@@ -1,13 +1,14 @@
 #include <cuda_runtime.h>
 
-// 
+//
 // craete your function: __global__ void kernel(...) here
-// 
+// Note: input data is of type uint8_t
+//
 
 
 // Host function to launch kernel
 torch::Tensor histogram_kernel(
-    torch::Tensor data,  // [length, num_channels]
+    torch::Tensor data,  // [length, num_channels], dtype=uint8
     int num_bins
 ) {
     TORCH_CHECK(data.device().is_cuda(), "Tensor data must be a CUDA tensor");

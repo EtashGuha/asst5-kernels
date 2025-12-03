@@ -1,6 +1,6 @@
 # Assignment 5 - Write a Fast Kernel # 
 
-**Due Thursday Dec 4, 11:59pm**
+**Due Thursday Dec 4, 11:59pm (Be aware that there are NO late days for this assignment.)**
 
 **100 points total**
 

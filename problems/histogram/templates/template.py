@@ -6,8 +6,8 @@ def custom_kernel(data: input_t) -> output_t:
     Args:
         data:
             Tuple of (array, num_bins) where:
-                array:    Tensor of shape [length, num_channels], containing integer
-                          values in the range [0, num_bins - 1]
+                array:    Tensor of shape [length, num_channels], dtype=uint8, containing
+                          integer values in the range [0, num_bins - 1]
                 num_bins: Number of histogram bins (defines allowed value range)
 
     Returns:
