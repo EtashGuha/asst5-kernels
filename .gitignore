@@ -6,3 +6,4 @@ dump/
 __pycache__/
 setup.sh
 profile_data/
+.DS_Store
